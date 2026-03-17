@@ -1,578 +1,470 @@
-local args = {
-	{
-		"M1"
-	}
+--[[
+    ╔═══════════════════════════════════════════════════════╗
+    ║              AutoPuncher v1.2                        ║
+    ║  Combo-synced punching + Reactive auto-block         ║
+    ╚═══════════════════════════════════════════════════════╝
+
+    Changes from v1.1:
+    • Reads the game's combo box UI to sync punches (no more desync)
+    • Multiple combo patterns, randomly selected each round
+    • Much faster reaction times (0.03s tick, 0.15s min punch interval)
+    • Handles all animation ID formats for block detection
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local LocalPlayer = Players.LocalPlayer
+
+-- compatibility shims (some executors don't support task library)
+local twait = (task and task.wait) or wait
+local tspawn = (task and task.spawn) or function(fn, ...) coroutine.wrap(fn)(...) end
+
+-- ══════════════════════════════════════
+--  CONFIGURATION
+-- ══════════════════════════════════════
+local CONFIG = {
+    PUNCH_RANGE        = 8,     -- studs: auto-punch when enemy within this
+    BLOCK_DETECT_RANGE = 10,     -- studs: detect enemy punches within this
+    PUNCH_COOLDOWN     = 0.015,   -- minimum seconds between punches
+    BLOCK_HOLD_TIME    = 0.35,   -- seconds to hold block
+    CHECK_DIRECTION    = true,   -- only block frontal attacks
+    M2_STAMINA_COST    = 35,
 }
-game:GetService("Players").LocalPlayer.Character:WaitForChild("Street Combat"):WaitForChild("LocalSide"):WaitForChild("MasterRemote"):FireServer(unpack(args))
 
-the remote above is to punch left hook. it consumes no stamina but it pauses the stamina refill. it also plays the animation rbxassetid://5699715909 when punched.
-
-local args = {
-	{
-		"M2"
-	}
+-- combo patterns (one is randomly picked each 6-hit cycle)
+local COMBOS = {
+    {"M1","M1","M1","M2","M1","M2"},  -- LLLRLR
+    {"M1","M2","M1","M1","M1","M2"},  -- LRLLLR
+    {"M1","M1","M1","M2","M1","M1"},  -- LLLRLL
 }
-game:GetService("Players").LocalPlayer.Character:WaitForChild("Street Combat"):WaitForChild("LocalSide"):WaitForChild("MasterRemote"):FireServer(unpack(args))
-the remote above is to punch right hook. it deals more damage but it also consumes stamina. (consumes 35 stamina each right hook.) also plays the animation rbxassetid://5699716581 when punched
 
-workspace.shinjisabi.Sweat.Value the stamina value. goes from 0 to 100 max. (when the stamina is full the value is 0)
+-- all known combat tool names (varies by map)
+local TOOL_NAMES = {"Street Combat", "Christmas Combat"}
 
--- RemoteEvent
+-- combo box image IDs (numeric, for matching with :match)
+local COMBO_IMAGES = {
+    L = "5543389536",
+    R = "5543390092",
+    S = "5543390574",
+}
 
-workspace.shinjisabi["Street Combat"]:FireServer({ "Block", "On" }) -- makes it hold block
--- RemoteEvent
-
-workspace.shinjisabi["Street Combat"]:FireServer({ "Block", "Off" }) -- makes it stop
-
-
-the remote above is to block. its a hold f keybind ingame but on the remotes if the block, on is called the localplayer will be holding block untill off is called.
-
-
-
-below this line is the localscript under the street combat tool the game gives us (fists)
-
--- Decompiled with Velocity Script Decompiler
-task.wait(1)
-local v1 = game:GetService("Players")
-local v_u_2 = game:GetService("ReplicatedStorage")
-local v_u_3 = v1.LocalPlayer
-script.MasterRemote:FireServer({ "SendPlayer" })
-local v_u_4 = nil
-pcall(function()
-    -- upvalues: (ref) v_u_4, (copy) v_u_2
-    v_u_4 = require(v_u_2:FindFirstChild("ShiftLockController"))
-end)
-local v_u_5 = nil
-pcall(function()
-    -- upvalues: (ref) v_u_5, (copy) v_u_2
-    v_u_5 = require(v_u_2:FindFirstChild("MobileButtonManager"))
-end)
-local v_u_6
-if v_u_3:FindFirstChild("ComboToggle") then
-    v_u_6 = v_u_3:FindFirstChild("ComboToggle")
-else
-    v_u_6 = Instance.new("BoolValue")
-    v_u_6.Name = "ComboToggle"
-    v_u_6.Parent = v_u_3
-    v_u_6.Value = true
+-- enemy punch animation IDs (all possible URL formats)
+local PUNCH_ANIMS = {}
+for _, id in pairs({"5699715909", "5699716581"}) do
+    PUNCH_ANIMS["rbxassetid://" .. id] = true
+    PUNCH_ANIMS[id] = true
+    PUNCH_ANIMS["http://www.roblox.com/asset/?id=" .. id] = true
+    PUNCH_ANIMS["https://www.roblox.com/asset/?id=" .. id] = true
 end
-local v_u_7 = v_u_3.Character or v_u_3.CharacterAdded:Wait()
-local v_u_8 = script.Parent
-local v_u_9 = workspace.CurrentCamera
-local v_u_10 = v_u_7:WaitForChild("Humanoid"):LoadAnimation(script:WaitForChild("Storage").Animations.Idle)
-local v_u_11 = {
-    [Enum.KeyCode.W] = {
-        ["Dir"] = Vector3.new(0, 0, -1)
-    },
-    [Enum.KeyCode.S] = {
-        ["Dir"] = Vector3.new(0, 0, 1)
-    },
-    [Enum.KeyCode.A] = {
-        ["Dir"] = Vector3.new(-1, 0, 0)
-    },
-    [Enum.KeyCode.D] = {
-        ["Dir"] = Vector3.new(1, 0, 0)
-    }
-}
-local v_u_12 = game:GetService("UserInputService")
-local v_u_13 = nil
-local v_u_14 = v_u_3.PlayerGui:WaitForChild("CombatGui", 10)
-if not v_u_14 then
-    warn("[LocalSide] CombatGui not found after 10 seconds!")
+
+-- ══════════════════════════════════════
+--  STATE
+-- ══════════════════════════════════════
+local isBlocking        = false
+local blockUntil        = 0
+local currentCombo      = COMBOS[math.random(#COMBOS)]
+local comboStep         = 1     -- internal combo counter (1-6)
+local lastPunchTime     = 0     -- tick() when we last punched
+local cachedRemote      = nil
+local animConnections   = {}
+
+-- ══════════════════════════════════════
+--  HELPERS
+-- ══════════════════════════════════════
+
+local function findCombatTool()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    for _, name in pairs(TOOL_NAMES) do
+        local tool = char:FindFirstChild(name)
+        if tool then return tool end
+    end
+    return nil
 end
-local v_u_15 = true
-local v_u_16 = v_u_12.TouchEnabled and not v_u_12.KeyboardEnabled and true or false
-local v_u_17 = false
-local v_u_18 = nil
-local v_u_19 = {
-    ["Position"] = nil,
-    ["Size"] = nil,
-    ["ImageTransparency"] = nil,
-    ["Visible"] = nil,
-    ["Active"] = nil
-}
-local v_u_20 = {
-    ["LeftPunch"] = Enum.KeyCode.ButtonX,
-    ["RightPunch"] = Enum.KeyCode.ButtonB,
-    ["Special"] = Enum.KeyCode.ButtonY,
-    ["Block"] = Enum.KeyCode.ButtonL2,
-    ["Dash"] = Enum.KeyCode.ButtonR2,
-    ["Shiftlock"] = Enum.KeyCode.ButtonL1
-}
-local function v_u_25()
-    -- upvalues: (copy) v_u_3, (copy) v_u_20
-    local v21 = v_u_3:FindFirstChild("ControllerKeybinds")
-    if v21 then
-        for v22, _ in pairs(v_u_20) do
-            local v23 = v21:FindFirstChild(v22)
-            if v23 and v23:IsA("StringValue") then
-                local v24 = Enum.KeyCode[v23.Value]
-                if v24 then
-                    v_u_20[v22] = v24
+
+local function getRemote()
+    if cachedRemote and cachedRemote.Parent then
+        return cachedRemote
+    end
+    local tool = findCombatTool()
+    if not tool then return nil end
+    local remote = tool:FindFirstChild("MasterRemote", true)
+    if not remote then
+        for _, desc in pairs(tool:GetDescendants()) do
+            if desc:IsA("RemoteEvent") and desc.Name == "MasterRemote" then
+                remote = desc
+                break
+            end
+        end
+    end
+    cachedRemote = remote
+    return remote
+end
+
+local function isEquipped()
+    return findCombatTool() ~= nil
+end
+
+local function getStamina()
+    local char = LocalPlayer.Character
+    if not char then return 100 end
+    local sweat = char:FindFirstChild("Sweat")
+    return sweat and sweat.Value or 100
+end
+
+local function myHRP()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function nearestEnemyDist()
+    local hrp = myHRP()
+    if not hrp then return math.huge end
+    local best = math.huge
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local eHRP = player.Character:FindFirstChild("HumanoidRootPart")
+            local hum  = player.Character:FindFirstChild("Humanoid")
+            if eHRP and hum and hum.Health > 0 then
+                local d = (hrp.Position - eHRP.Position).Magnitude
+                if d < best then best = d end
+            end
+        end
+    end
+    return best
+end
+
+-- ══════════════════════════════════════
+--  COMBO BOX READER (from dojo.lua)
+--  Reads the game's combo UI using image ID matching
+-- ══════════════════════════════════════
+
+local function readCombo()
+    local ok, combo = pcall(function()
+        local box = LocalPlayer.PlayerGui.CombatGui.ComboFrame.ComboBox
+        local result = {}
+        for i = 1, 6 do
+            local move = box:FindFirstChild("Move" .. i)
+            if move and move.Visible then
+                local imageId = move.Image:match("%d+")
+                if imageId then
+                    if imageId == COMBO_IMAGES.L then
+                        table.insert(result, "L")
+                    elseif imageId == COMBO_IMAGES.R then
+                        table.insert(result, "R")
+                    elseif imageId == COMBO_IMAGES.S then
+                        table.insert(result, "S")
+                    end
                 end
             end
         end
-    end
+        return result
+    end)
+    return ok and combo or {}
 end
-v_u_25()
-local v_u_26 = v_u_3:FindFirstChild("ControllerKeybinds")
-local v_u_27
-if v_u_26 then
-    v_u_27 = v_u_5
-    for _, v28 in ipairs(v_u_26:GetChildren()) do
-        if v28:IsA("StringValue") then
-            v28.Changed:Connect(function()
-                -- upvalues: (copy) v_u_25
-                v_u_25()
-            end)
-        end
-    end
-    v_u_26.ChildAdded:Connect(function(p29)
-        -- upvalues: (copy) v_u_25
-        if p29:IsA("StringValue") then
-            v_u_25()
-            p29.Changed:Connect(function()
-                -- upvalues: (ref) v_u_25
-                v_u_25()
-            end)
-        end
-    end)
-else
-    v_u_27 = v_u_5
-end
-v_u_3.ChildAdded:Connect(function(p30)
-    -- upvalues: (ref) v_u_26, (copy) v_u_25
-    if p30.Name == "ControllerKeybinds" and p30:IsA("Folder") then
-        v_u_26 = p30
-        v_u_25()
-        for _, v31 in ipairs(p30:GetChildren()) do
-            if v31:IsA("StringValue") then
-                v31.Changed:Connect(function()
-                    -- upvalues: (ref) v_u_25
-                    v_u_25()
-                end)
-            end
-        end
-        p30.ChildAdded:Connect(function(p32)
-            -- upvalues: (ref) v_u_25
-            if p32:IsA("StringValue") then
-                v_u_25()
-                p32.Changed:Connect(function()
-                    -- upvalues: (ref) v_u_25
-                    v_u_25()
-                end)
-            end
-        end)
-    end
-end)
-local v_u_33 = v_u_7:WaitForChild("Humanoid")
-v_u_12.JumpRequest:Connect(function()
-    -- upvalues: (ref) v_u_15, (copy) v_u_33
-    if not v_u_15 then
-        v_u_33.Jump = false
-    end
-end)
-v_u_33.StateChanged:Connect(function(_, p34)
-    -- upvalues: (ref) v_u_15
-    if p34 == Enum.HumanoidStateType.Jumping and v_u_15 then
-        v_u_15 = false
-        task.delay(0, function()
-            -- upvalues: (ref) v_u_15
-            v_u_15 = true
-        end)
-    end
-end)
-function InputBegan(p_u_35, p36)
-    -- upvalues: (copy) v_u_11, (copy) v_u_12, (ref) v_u_13, (copy) v_u_9, (ref) v_u_16, (copy) v_u_8, (copy) v_u_7, (ref) v_u_6, (ref) v_u_14, (copy) v_u_20, (copy) v_u_3, (ref) v_u_4
-    for v37, v38 in pairs(v_u_11) do
-        if v_u_12:IsKeyDown(v37) then
-            v_u_13 = {
-                v37,
-                v38.Dir,
-                v_u_9.CFrame.Position,
-                v_u_9.Focus.Position
-            }
-        end
-    end
-    if v_u_12.TouchEnabled and not v_u_12.KeyboardEnabled then
-        v_u_16 = true
-    else
-        v_u_16 = false
-    end
-    if p_u_35.UserInputType == Enum.UserInputType.MouseButton1 and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "M1" })
-        return
-    elseif p_u_35.UserInputType == Enum.UserInputType.MouseButton2 and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "M2" })
-        return
-    elseif p_u_35.KeyCode == Enum.KeyCode.F and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "Block", "On" })
-        return
-    elseif p_u_35.KeyCode == Enum.KeyCode.Q and (v_u_8.Parent == v_u_7 and (v_u_13 and not p36)) then
-        local v39 = { "Dash", v_u_13 }
-        script.MasterRemote:FireServer(v39)
-        return
-    elseif p_u_35.KeyCode == Enum.KeyCode.X and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "RageReset" })
-        return
-    elseif p_u_35.KeyCode == Enum.KeyCode.R and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "RageMove" })
-        return
-    elseif p_u_35.KeyCode == Enum.KeyCode.Z and not p36 then
-        if v_u_6.Value == true then
-            v_u_6.Value = false
-            v_u_14.ComboFrame.Visible = false
-        else
-            v_u_6.Value = true
-        end
-    elseif p_u_35.KeyCode == v_u_20.LeftPunch and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "M1" })
-        return
-    elseif p_u_35.KeyCode == v_u_20.RightPunch and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "M2" })
-        return
-    elseif p_u_35.KeyCode == v_u_20.Special and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "RageMove" })
-        return
-    elseif p_u_35.KeyCode == v_u_20.Block and (v_u_8.Parent == v_u_7 and not p36) then
-        script.MasterRemote:FireServer({ "Block", "On" })
-        return
-    elseif p_u_35.KeyCode == v_u_20.Dash and (v_u_8.Parent == v_u_7 and not p36) then
-        local v40 = require(v_u_3.PlayerScripts.PlayerModule.ControlModule):GetMoveVector()
-        if v40 == Vector3.new(0, 0, 0) then
-            v_u_13 = {
-                p_u_35.KeyCode,
-                Vector3.new(0, 0, -1),
-                v_u_9.CFrame.Position,
-                v_u_9.Focus.Position
-            }
-        else
-            v_u_13 = {
-                p_u_35.KeyCode,
-                v40,
-                v_u_9.CFrame.Position,
-                v_u_9.Focus.Position
-            }
-        end
-        local v41 = { "Dash", v_u_13 }
-        script.MasterRemote:FireServer(v41)
-    elseif p_u_35.KeyCode == v_u_20.Shiftlock and not p36 then
-        local v_u_42 = game:GetService("ContextActionService")
-        pcall(function()
-            -- upvalues: (copy) v_u_42, (copy) p_u_35
-            v_u_42:CallFunction("MouseLockSwitchAction", Enum.UserInputState.Begin, p_u_35)
-        end)
-        if v_u_4 and v_u_4.OnShiftLockToggled then
-            pcall(function()
-                -- upvalues: (ref) v_u_4
-                v_u_4.OnShiftLockToggled:Fire()
-            end)
-        end
-    end
-end
-local v_u_43 = v_u_14
-if v_u_43 then
-    v_u_43 = v_u_14:WaitForChild("ButtonSet", 5)
-end
-if v_u_43 then
-    print("[LocalSide] MobileButtons (ButtonSet) found, connecting events")
-    v_u_43.RageMove.Activated:Connect(function()
-        -- upvalues: (ref) v_u_27
-        local v44
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v44 = v_u_27:IsButtonsDisabled()
-        else
-            v44 = false
-        end
-        if not v44 then
-            script.MasterRemote:FireServer({ "RageMove" })
-        end
-    end)
-    v_u_43.Dash.Activated:Connect(function()
-        -- upvalues: (ref) v_u_27, (copy) v_u_3, (copy) v_u_9
-        local v45
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v45 = v_u_27:IsButtonsDisabled()
-        else
-            v45 = false
-        end
-        if v45 then
-            return
-        else
-            local v46 = require(v_u_3.PlayerScripts.PlayerModule.ControlModule):GetMoveVector()
-            local v47 = {
-                Enum.KeyCode.W,
-                v46,
-                v_u_9.CFrame.Position,
-                v_u_9.Focus.Position
-            }
-            if v46 == Vector3.new(0, 0, 0) then
-                local v48 = {
-                    "Dash",
-                    {
-                        Enum.KeyCode.W,
-                        Vector3.new(0, 0, -1),
-                        v_u_9.CFrame.Position,
-                        v_u_9.Focus.Position
-                    }
-                }
-                script.MasterRemote:FireServer(v48)
-            else
-                script.MasterRemote:FireServer({ "Dash", v47 })
-            end
-        end
-    end)
-    v_u_43.Jump.Activated:Connect(function()
-        -- upvalues: (ref) v_u_27, (ref) v_u_15, (copy) v_u_7
-        local v49
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v49 = v_u_27:IsButtonsDisabled()
-        else
-            v49 = false
-        end
-        if v49 then
-            return
-        elseif v_u_15 then
-            local v50 = v_u_7:FindFirstChild("Humanoid")
-            if v50 and (v50.Health > 0 and v50:GetState() ~= Enum.HumanoidStateType.Freefall) then
-                v50:ChangeState(Enum.HumanoidStateType.Jumping)
-            end
-        end
-    end)
-    v_u_43.Block.InputBegan:Connect(function()
-        -- upvalues: (ref) v_u_27
-        local v51
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v51 = v_u_27:IsButtonsDisabled()
-        else
-            v51 = false
-        end
-        if not v51 then
-            script.MasterRemote:FireServer({ "Block", "On" })
-        end
-    end)
-    v_u_43.Block.InputEnded:Connect(function()
-        -- upvalues: (ref) v_u_27
-        local v52
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v52 = v_u_27:IsButtonsDisabled()
-        else
-            v52 = false
-        end
-        if not v52 then
-            script.MasterRemote:FireServer({ "Block", "Off" })
-        end
-    end)
-    v_u_43.RightMouse.InputBegan:Connect(function()
-        -- upvalues: (ref) v_u_27
-        local v53
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v53 = v_u_27:IsButtonsDisabled()
-        else
-            v53 = false
-        end
-        if not v53 then
-            script.MasterRemote:FireServer({ "M2" })
-        end
-    end)
-    v_u_43.LeftMouse.InputBegan:Connect(function()
-        -- upvalues: (ref) v_u_27
-        local v54
-        if v_u_27 and v_u_27.IsButtonsDisabled then
-            v54 = v_u_27:IsButtonsDisabled()
-        else
-            v54 = false
-        end
-        if not v54 then
-            script.MasterRemote:FireServer({ "M1" })
-        end
-    end)
-else
-    warn("[LocalSide] MobileButtons (ButtonSet) not found! Mobile controls won\'t work.")
-end
-function InputEnded(p55)
-    -- upvalues: (copy) v_u_8, (copy) v_u_7, (copy) v_u_20
-    if p55.KeyCode == Enum.KeyCode.F and v_u_8.Parent == v_u_7 then
-        script.MasterRemote:FireServer({ "Block", "Off" })
-    elseif p55.KeyCode == v_u_20.Block and v_u_8.Parent == v_u_7 then
-        script.MasterRemote:FireServer({ "Block", "Off" })
-    end
-end
-local v_u_56 = nil
-local v_u_57 = nil
-v_u_8.Equipped:Connect(function()
-    -- upvalues: (ref) v_u_17, (copy) v_u_10, (copy) v_u_3, (ref) v_u_14, (ref) v_u_16, (ref) v_u_27, (ref) v_u_18, (copy) v_u_19, (ref) v_u_56, (copy) v_u_12, (ref) v_u_57
-    v_u_17 = true
-    v_u_10:Play()
-    local v58 = v_u_3.PlayerGui:FindFirstChild("CombatGui")
-    if v58 then
-        v_u_14 = v58
-        local v59 = v58:FindFirstChild("ButtonSet")
-        if v_u_16 and v59 then
-            v59.Visible = true
-            if v_u_27 and v_u_27.RefreshForNewButtonSet then
-                v_u_27:RefreshForNewButtonSet()
-            end
-            if v_u_18 then
-                v_u_18:Disconnect()
-            end
-            v_u_18 = game:GetService("RunService").Heartbeat:Connect(function()
-                -- upvalues: (ref) v_u_17, (ref) v_u_3, (ref) v_u_19
-                if v_u_17 then
-                    local v60 = v_u_3:FindFirstChild("PlayerGui")
-                    if v60 then
-                        local v61 = v60:FindFirstChild("TouchGui")
-                        if v61 then
-                            local v62 = v61:FindFirstChild("TouchControlFrame")
-                            if v62 then
-                                local v63 = v62:FindFirstChild("JumpButton")
-                                if v63 then
-                                    if not v_u_19.Position then
-                                        v_u_19.Position = v63.Position
-                                        v_u_19.Size = v63.Size
-                                        v_u_19.ImageTransparency = v63.ImageTransparency
-                                        v_u_19.Visible = v63.Visible
-                                        v_u_19.Active = v63.Active
-                                    end
-                                    v63.Visible = false
-                                    v63.Active = false
-                                    v63.ImageTransparency = 1
-                                    v63.Position = UDim2.new(10, 0, 10, 0)
-                                    v63.Size = UDim2.new(0, 0, 0, 0)
-                                end
-                            end
-                        else
-                            return
-                        end
-                    else
-                        return
-                    end
+
+-- ══════════════════════════════════════
+--  DYNAMIC STAMINA OPTIMIZATION (from dojo.lua)
+--  Looks ahead at the full combo and swaps R→L where stamina is insufficient
+--  Reserves stamina for the final R hit (finisher)
+-- ══════════════════════════════════════
+
+local function optimizeCombo(pattern)
+    local stamina = 100 - getStamina()  -- convert: 0=empty → 100=full
+    local optimized = {}
+    local remaining = stamina
+
+    for i, move in ipairs(pattern) do
+        local isLast = (i == #pattern)
+
+        if move == "M2" then
+            if isLast then
+                -- last hit: try to keep R for the finisher/stun
+                if remaining >= CONFIG.M2_STAMINA_COST then
+                    table.insert(optimized, "M2")
                 else
-                    return
-                end
-            end)
-            print("[LocalSide] Mobile buttons shown (tool equipped, positions refreshed)")
-        elseif v_u_16 then
-            warn("[LocalSide] ButtonSet not found in CombatGui!")
-        end
-    else
-        warn("[LocalSide] CombatGui not found when equipping tool!")
-    end
-    v_u_56 = v_u_12.InputBegan:Connect(InputBegan)
-    v_u_57 = v_u_12.InputEnded:Connect(InputEnded)
-end)
-v_u_8.Unequipped:Connect(function()
-    -- upvalues: (ref) v_u_17, (copy) v_u_10, (copy) v_u_3, (ref) v_u_14, (ref) v_u_16, (ref) v_u_18, (copy) v_u_19, (ref) v_u_56, (ref) v_u_57
-    v_u_17 = false
-    v_u_10:Stop()
-    local v64 = v_u_3.PlayerGui:FindFirstChild("CombatGui")
-    if v64 then
-        v_u_14 = v64
-        local v65 = v64:FindFirstChild("ButtonSet")
-        if v65 then
-            v65.Visible = false
-        end
-    end
-    if v_u_16 then
-        if v_u_18 then
-            v_u_18:Disconnect()
-            v_u_18 = nil
-        end
-        task.defer(function()
-            -- upvalues: (ref) v_u_3, (ref) v_u_19
-            local v66 = v_u_3:FindFirstChild("PlayerGui")
-            if v66 then
-                local v67 = v66:FindFirstChild("TouchGui")
-                if v67 then
-                    local v68 = v67:FindFirstChild("TouchControlFrame")
-                    if v68 then
-                        local v69 = v68:FindFirstChild("JumpButton")
-                        if v69 and v_u_19.Position then
-                            v69.Position = v_u_19.Position
-                            v69.Size = v_u_19.Size
-                            v69.ImageTransparency = v_u_19.ImageTransparency
-                            v69.Visible = v_u_19.Visible
-                            v69.Active = v_u_19.Active
-                        end
-                    end
-                else
-                    return
+                    table.insert(optimized, "M1")  -- not enough, downgrade
                 end
             else
-                return
+                -- mid-combo: only use R if we can still afford the final R
+                if remaining >= CONFIG.M2_STAMINA_COST + CONFIG.M2_STAMINA_COST then
+                    table.insert(optimized, "M2")
+                    remaining = remaining - CONFIG.M2_STAMINA_COST
+                else
+                    table.insert(optimized, "M1")  -- save stamina for finisher
+                end
+            end
+        else
+            table.insert(optimized, "M1")
+        end
+    end
+
+    return optimized
+end
+
+-- ══════════════════════════════════════
+--  AUTO-BLOCK SYSTEM
+-- ══════════════════════════════════════
+
+local function blockOn()
+    if not isEquipped() then return end
+    local remote = getRemote()
+    if not remote then return end
+    isBlocking = true
+    blockUntil = tick() + CONFIG.BLOCK_HOLD_TIME
+    pcall(function() remote:FireServer({"Block", "On"}) end)
+end
+
+local function blockOff()
+    isBlocking = false
+    local remote = getRemote()
+    if not remote then return end
+    pcall(function() remote:FireServer({"Block", "Off"}) end)
+end
+
+local function onEnemyPunch(enemyCharacter)
+    if not isEquipped() then return end
+    local hrp  = myHRP()
+    local eHRP = enemyCharacter:FindFirstChild("HumanoidRootPart")
+    if not hrp or not eHRP then return end
+
+    local dist = (hrp.Position - eHRP.Position).Magnitude
+    if dist > CONFIG.BLOCK_DETECT_RANGE then return end
+
+    -- direction check: don't block behind attacks (guard break)
+    if CONFIG.CHECK_DIRECTION then
+        local toEnemy = (eHRP.Position - hrp.Position)
+        local look    = hrp.CFrame.LookVector
+        local flatTo  = Vector3.new(toEnemy.X, 0, toEnemy.Z)
+        local flatLk  = Vector3.new(look.X, 0, look.Z)
+        if flatTo.Magnitude > 0.01 and flatLk.Magnitude > 0.01 then
+            if flatTo.Unit:Dot(flatLk.Unit) < 0 then
+                return  -- behind us
+            end
+        end
+    end
+
+    if isBlocking then
+        blockUntil = tick() + CONFIG.BLOCK_HOLD_TIME  -- extend
+    else
+        blockOn()
+    end
+end
+
+-- ══════════════════════════════════════
+--  ANIMATION HOOKING (for auto-block)
+-- ══════════════════════════════════════
+
+local function connectPlayer(player)
+    if animConnections[player] then
+        for _, conn in pairs(animConnections[player]) do
+            pcall(function() conn:Disconnect() end)
+        end
+    end
+    animConnections[player] = {}
+
+    local function hookCharacter(character)
+        if not character then return end
+        local humanoid = character:WaitForChild("Humanoid", 10)
+        if not humanoid then return end
+        local animator = humanoid:FindFirstChildOfClass("Animator") or humanoid:WaitForChild("Animator", 10)
+        if not animator then return end
+
+        local conn = animator.AnimationPlayed:Connect(function(animTrack)
+            local ok, animId = pcall(function()
+                return animTrack.Animation and animTrack.Animation.AnimationId
+            end)
+            if ok and animId and PUNCH_ANIMS[animId] then
+                onEnemyPunch(character)
             end
         end)
+        table.insert(animConnections[player], conn)
     end
-    if v_u_56 then
-        v_u_56:Disconnect()
+
+    if player.Character then
+        tspawn(function() hookCharacter(player.Character) end)
     end
-    if v_u_57 then
-        v_u_57:Disconnect()
+
+    local c = player.CharacterAdded:Connect(function(char)
+        twait(1)
+        hookCharacter(char)
+    end)
+    table.insert(animConnections[player], c)
+end
+
+local function setupBlockDetection()
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            connectPlayer(player)
+        end
     end
-    script.MasterRemote:FireServer({ "Block", "Off" })
+    Players.PlayerAdded:Connect(function(p) connectPlayer(p) end)
+    Players.PlayerRemoving:Connect(function(p)
+        if animConnections[p] then
+            for _, conn in pairs(animConnections[p]) do
+                pcall(function() conn:Disconnect() end)
+            end
+            animConnections[p] = nil
+        end
+    end)
+end
+
+-- ══════════════════════════════════════
+--  AUTO-PUNCH SYSTEM
+--  Uses readCombo() for sync + optimizeCombo() for stamina
+-- ══════════════════════════════════════
+
+local function throwPunch()
+    if isBlocking then return end
+    if not isEquipped() then return end
+    local remote = getRemote()
+    if not remote then return end
+
+    -- cooldown check
+    local now = tick()
+    if now - lastPunchTime < CONFIG.PUNCH_COOLDOWN then return end
+
+    -- read the game's combo box to know what step we're actually on
+    local gameCombo = readCombo()
+    local gameStep = #gameCombo
+
+    -- combo complete (6 hits) — pick new combo, wait for game reset
+    if gameStep >= 6 then
+        currentCombo = optimizeCombo(COMBOS[math.random(#COMBOS)])
+        comboStep = 1
+        return
+    end
+
+    -- combo was reset by game — start fresh
+    if gameStep == 0 then
+        comboStep = 1
+    end
+
+    -- re-optimize current combo based on live stamina
+    local optimized = optimizeCombo(currentCombo)
+
+    -- get the punch for current step
+    local action = optimized[comboStep] or "M1"
+
+    pcall(function() remote:FireServer({action}) end)
+    lastPunchTime = now
+
+    -- advance combo step
+    comboStep = comboStep + 1
+    if comboStep > #currentCombo then
+        comboStep = 1
+        currentCombo = COMBOS[math.random(#COMBOS)]  -- pick new combo next cycle
+    end
+end
+
+-- ══════════════════════════════════════
+--  STARTUP DIAGNOSTICS
+-- ══════════════════════════════════════
+
+local function runDiagnostics()
+    warn("═══════════════════════════════════════")
+    warn("[AutoPuncher v1.2] Diagnostics")
+    local char = LocalPlayer.Character
+    if not char then
+        warn("  ✗ No character!")
+        return
+    end
+    warn("  ✓ Character: " .. char.Name)
+    warn("  " .. (myHRP() and "✓" or "✗") .. " HumanoidRootPart")
+
+    local sweat = char:FindFirstChild("Sweat")
+    warn("  " .. (sweat and "✓" or "✗") .. " Stamina: " .. (sweat and tostring(sweat.Value) or "N/A"))
+
+    local tool = findCombatTool()
+    warn("  " .. (tool and "✓" or "✗") .. " Combat tool: " .. (tool and tool.Name or "NOT EQUIPPED"))
+
+    if tool then
+        local remote = tool:FindFirstChild("MasterRemote", true)
+        warn("  " .. (remote and "✓" or "✗") .. " MasterRemote: " .. (remote and remote:GetFullName() or "NOT FOUND"))
+        if remote then cachedRemote = remote end
+        if not remote then
+            warn("  Descendants:")
+            for _, d in pairs(tool:GetDescendants()) do
+                warn("    " .. d:GetFullName() .. " (" .. d.ClassName .. ")")
+            end
+        end
+    end
+
+    local gameCombo = readCombo()
+    warn("  ℹ Combo box: " .. (#gameCombo > 0 and table.concat(gameCombo, "→") or "empty") .. " (" .. #gameCombo .. "/6)")
+
+    local others = 0
+    for _, p in pairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then others = others + 1 end
+    end
+    warn("  ℹ Other players: " .. others)
+    warn("═══════════════════════════════════════")
+end
+
+-- ══════════════════════════════════════
+--  MAIN LOOP
+-- ══════════════════════════════════════
+
+runDiagnostics()
+setupBlockDetection()
+
+LocalPlayer.CharacterAdded:Connect(function()
+    twait(2)
+    isBlocking        = false
+    comboStep         = 1
+    lastPunchTime     = 0
+    cachedRemote      = nil
+    currentCombo      = COMBOS[math.random(#COMBOS)]
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then connectPlayer(player) end
+    end
+    runDiagnostics()
 end)
-local v_u_70 = {
-    ["L"] = 5543389536,
-    ["R"] = 5543390092,
-    ["S"] = 5543390574
-}
-local v_u_71 = {
-    ["L"] = Color3.fromRGB(255, 255, 255),
-    ["R"] = Color3.fromRGB(212, 40, 40),
-    ["S"] = Color3.fromRGB(181, 70, 5)
-}
-local v_u_72 = false
-script.MasterRemote.OnClientEvent:Connect(function(p73, p74, p75, p76)
-    -- upvalues: (ref) v_u_72, (ref) v_u_6, (ref) v_u_16, (ref) v_u_14, (copy) v_u_70, (copy) v_u_71
-    if p73 == "AddCombo" then
-        if v_u_72 then
-            p74 = p74 + 1
+
+warn("[AutoPuncher v1.2] Started!")
+warn("  Punch range: " .. CONFIG.PUNCH_RANGE .. " studs | Block range: " .. CONFIG.BLOCK_DETECT_RANGE .. " studs")
+warn("  Combos: LLLRLR / LRLLLR / LLLRLL (random each cycle)")
+warn("  Punch cooldown: " .. CONFIG.PUNCH_COOLDOWN .. "s | Block hold: " .. CONFIG.BLOCK_HOLD_TIME .. "s")
+
+local lastDebugTime = 0
+
+-- Heartbeat fires every frame (~60fps / 0.016s) — fastest possible tick
+RunService.Heartbeat:Connect(function()
+    local ok, err = pcall(function()
+        local now = tick()
+
+        -- block timer
+        if isBlocking and now > blockUntil then
+            blockOff()
         end
-        if v_u_6.Value == true and not v_u_16 then
-            v_u_14.ComboFrame.Visible = true
-        else
-            v_u_14.ComboFrame.Visible = false
+
+        -- auto-punch
+        if not isBlocking and isEquipped() then
+            local dist = nearestEnemyDist()
+            if dist <= CONFIG.PUNCH_RANGE then
+                throwPunch()
+            else
+                comboStep = 1
+            end
         end
-        local v77 = v_u_14.ComboFrame.ComboBox:FindFirstChild("Move" .. tostring(p74))
-        local v78 = v_u_70[p75]
-        v77.Image = "rbxassetid://" .. tostring(v78)
-        if p76 then
-            v77.Size = UDim2.new(0, 30, 0, 30)
-            v77.Rotation = 0
-            v77.Position = UDim2.new(0, (p74 - 1) * 46 + 8, 0, 6)
-            game:GetService("TweenService"):Create(v77, TweenInfo.new(0.2, Enum.EasingStyle.Elastic, Enum.EasingDirection.Out), {
-                ["Size"] = UDim2.new(0, 46, 0, 42),
-                ["Rotation"] = math.random(-100, 100) / 10,
-                ["Position"] = UDim2.new(0, (p74 - 1) * 46, 0, 0)
-            }):Play()
-            v77.ImageTransparency = 0
-            v77.ImageColor3 = v_u_71[p75]
-        else
-            v77.Size = UDim2.new(0, 46, 0, 42)
-            v77.ImageTransparency = 0.4
-            v77.ImageColor3 = Color3.fromRGB(200, 200, 200)
-            v77.Rotation = 0
+
+        -- debug log every 3s when enemies are close
+        if now - lastDebugTime > 3 then
+            lastDebugTime = now
+            local dist = nearestEnemyDist()
+            if dist < 30 then
+                local gc = readCombo()
+                warn(string.format("[AP] Dist:%.1f | Block:%s | Step:%d/%d | Game:%s | Pattern:%s",
+                    dist, tostring(isBlocking), comboStep, #currentCombo,
+                    #gc > 0 and table.concat(gc, "") or "-",
+                    table.concat(optimizeCombo(currentCombo), "")))
+            end
         end
-        v77.Visible = true
-        if p75 == "S" then
-            v_u_72 = true
-            return
-        end
-    elseif p73 == "ResetCombo" then
-        v_u_72 = false
-        v_u_14.ComboFrame.Visible = false
-        for _, v79 in pairs(v_u_14.ComboFrame.ComboBox:GetChildren()) do
-            v79.Visible = false
-        end
+    end)
+
+    if not ok then
+        warn("[AutoPuncher] Error: " .. tostring(err))
     end
 end)
-v_u_7:WaitForChild("Rage").Changed:Connect(function()
-    -- upvalues: (ref) v_u_16, (copy) v_u_7, (copy) v_u_43
-    if v_u_16 then
-        if v_u_7.Rage.Value >= 100 then
-            v_u_43.RageMove.Visible = true
-            return
-        end
-        v_u_43.RageMove.Visible = false
-    end
-end)
+
+warn("[AutoPuncher] Main loop running on Heartbeat (~60fps)")
