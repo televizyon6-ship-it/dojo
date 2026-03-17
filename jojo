@@ -23,12 +23,13 @@ local tspawn = (task and task.spawn) or function(fn, ...) coroutine.wrap(fn)(...
 --  CONFIGURATION
 -- ══════════════════════════════════════
 local CONFIG = {
-    PUNCH_RANGE        = 8,     -- studs: auto-punch when enemy within this
-    BLOCK_DETECT_RANGE = 10,     -- studs: detect enemy punches within this
+    PUNCH_RANGE        = 7,     -- studs: auto-punch when enemy within this
+    BLOCK_DETECT_RANGE = 12,     -- studs: detect enemy punches within this
     PUNCH_COOLDOWN     = 0.015,   -- minimum seconds between punches
-    BLOCK_HOLD_TIME    = 0.35,   -- seconds to hold block
+    BLOCK_HOLD_TIME    = 0.45,   -- seconds to hold block
     CHECK_DIRECTION    = true,   -- only block frontal attacks
     M2_STAMINA_COST    = 35,
+    TWEEN_SPEED        = 0.05,   -- ~20% speed boost (added studs per frame)
 }
 
 -- combo patterns (one is randomly picked each 6-hit cycle)
@@ -165,34 +166,37 @@ end
 
 -- ══════════════════════════════════════
 --  DYNAMIC STAMINA OPTIMIZATION (from dojo.lua)
---  Looks ahead at the full combo and swaps R→L where stamina is insufficient
---  Reserves stamina for the final R hit (finisher)
+--  ALWAYS ends combo with R unless Sweat > 65 (too drained)
+--  Reserves stamina for the forced R finisher
 -- ══════════════════════════════════════
 
 local function optimizeCombo(pattern)
-    local stamina = 100 - getStamina()  -- convert: 0=empty → 100=full
+    local sweatValue = getStamina()           -- raw Sweat: 0=full, 100=empty
+    local stamina = 100 - sweatValue          -- usable stamina: 100=full, 0=empty
+    local canFinishR = (sweatValue <= 65)     -- force R finisher unless too drained
     local optimized = {}
     local remaining = stamina
+
+    -- if we're forcing R finisher, reserve stamina for it
+    local reserveForFinisher = canFinishR and CONFIG.M2_STAMINA_COST or 0
 
     for i, move in ipairs(pattern) do
         local isLast = (i == #pattern)
 
-        if move == "M2" then
-            if isLast then
-                -- last hit: try to keep R for the finisher/stun
-                if remaining >= CONFIG.M2_STAMINA_COST then
-                    table.insert(optimized, "M2")
-                else
-                    table.insert(optimized, "M1")  -- not enough, downgrade
-                end
+        if isLast then
+            -- LAST HIT: always R if we can afford it (Sweat <= 65)
+            if canFinishR and remaining >= CONFIG.M2_STAMINA_COST then
+                table.insert(optimized, "M2")
             else
-                -- mid-combo: only use R if we can still afford the final R
-                if remaining >= CONFIG.M2_STAMINA_COST + CONFIG.M2_STAMINA_COST then
-                    table.insert(optimized, "M2")
-                    remaining = remaining - CONFIG.M2_STAMINA_COST
-                else
-                    table.insert(optimized, "M1")  -- save stamina for finisher
-                end
+                table.insert(optimized, "M1")
+            end
+        elseif move == "M2" then
+            -- mid-combo R: only if we can afford this AND still have enough for finisher
+            if remaining >= CONFIG.M2_STAMINA_COST + reserveForFinisher then
+                table.insert(optimized, "M2")
+                remaining = remaining - CONFIG.M2_STAMINA_COST
+            else
+                table.insert(optimized, "M1")  -- save stamina for finisher
             end
         else
             table.insert(optimized, "M1")
@@ -446,6 +450,14 @@ RunService.Heartbeat:Connect(function()
             else
                 comboStep = 1
             end
+        end
+
+        -- tweenspeed (CFrame speed boost)
+        local hrp = myHRP()
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid")
+        if hrp and hum and hum.WalkSpeed >= 6 and hum.MoveDirection.Magnitude > 0 then
+            -- MoveDirection is a normalized vector of the direction the player is trying to walk
+            hrp.CFrame = hrp.CFrame + (hum.MoveDirection * CONFIG.TWEEN_SPEED)
         end
 
         -- debug log every 3s when enemies are close
