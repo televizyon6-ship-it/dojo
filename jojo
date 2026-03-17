@@ -324,25 +324,16 @@ local function throwPunch()
     local remote = getRemote()
     if not remote then return end
 
-    -- cooldown check
     local now = tick()
+    
+    -- if we haven't punched in a while (game reset our combo), start fresh
+    if now - lastPunchTime > 1.0 then
+        comboStep = 1
+        currentCombo = COMBOS[math.random(#COMBOS)]
+    end
+
+    -- cooldown check
     if now - lastPunchTime < CONFIG.PUNCH_COOLDOWN then return end
-
-    -- read the game's combo box to know what step we're actually on
-    local gameCombo = readCombo()
-    local gameStep = #gameCombo
-
-    -- combo complete (6 hits) — pick new combo, wait for game reset
-    if gameStep >= 6 then
-        currentCombo = optimizeCombo(COMBOS[math.random(#COMBOS)])
-        comboStep = 1
-        return
-    end
-
-    -- combo was reset by game — start fresh
-    if gameStep == 0 then
-        comboStep = 1
-    end
 
     -- re-optimize current combo based on live stamina
     local optimized = optimizeCombo(currentCombo)
