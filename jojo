@@ -29,7 +29,7 @@ local CONFIG = {
     BLOCK_HOLD_TIME    = 0.45,   -- seconds to hold block
     CHECK_DIRECTION    = true,   -- only block frontal attacks
     M2_STAMINA_COST    = 35,
-    TWEEN_SPEED        = 0.05,   -- ~20% speed boost (added studs per frame)
+    TWEEN_SPEED        = 0.03,   -- ~20% speed boost (added studs per frame)
 }
 
 -- combo patterns (one is randomly picked each 6-hit cycle)
